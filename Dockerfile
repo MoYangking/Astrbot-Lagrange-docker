@@ -1,90 +1,111 @@
-# ====================================================================================
-# Stage 1: Build the .NET application
-# ====================================================================================
-FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:9.0-bookworm-slim AS build-dotnet
+# 使用Ubuntu 22.04 LTS作为基础镜像
+FROM ubuntu:latest
 
-WORKDIR /root/build
+# 设置维护者信息
+LABEL maintainer="your-email@example.com"
+LABEL description="AstrBot与Lagrange.OneBot基于Ubuntu 22.04的Docker镜像，使用Supervisor管理进程"
 
-ARG TARGETARCH
+# 设置环境变量，避免在安装过程中出现交互式提示
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
 
-# Install git and clone the Lagrange.Core repository
-RUN apt-get update && apt-get install -y git && \
-    git clone --depth=1 https://github.com/LagrangeDev/Lagrange.Core.git c && \
-    rm -rf /var/lib/apt/lists/*
-
-# Publish the .NET application
-RUN dotnet publish -p:DebugType="none" -a $TARGETARCH -f "net9.0" \
-    -o /root/out c/Lagrange.OneBot
-
-
-# ====================================================================================
-# Stage 2: Final image with Python virtual environment
-# ====================================================================================
-FROM python:3.11-slim
-
-# Install system dependencies including .NET runtime
-RUN apt-get update && \
-    apt-get install -y wget apt-transport-https gnupg ca-certificates git && \
-    wget https://packages.microsoft.com/config/debian/11/packages-microsoft-prod.deb && \
-    dpkg -i packages-microsoft-prod.deb && \
-    rm packages-microsoft-prod.deb && \
-    apt-get update && \
-    apt-get install -y dotnet-runtime-9.0 supervisor gosu gcc build-essential python3-dev libffi-dev libssl-dev && \
-    rm -rf /var/lib/apt/lists/*
-
-# Set up the application directory
+# 设置工作目录
 WORKDIR /app
 
-# Copy the built .NET application and entrypoint script from the build stage
-COPY --from=build-dotnet /root/out /app/bin
-COPY --from=build-dotnet /root/build/c/Lagrange.OneBot/Resources/docker-entrypoint.sh /app/bin/docker-entrypoint.sh
-RUN chmod +x /app/bin/docker-entrypoint.sh
+# 更新包列表并安装基础依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    ca-certificates \
+    curl \
+    wget \
+    git \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt-get update
 
-# Clone the Python application repository
-RUN git clone --depth=1 https://github.com/AstrBotDevs/AstrBot.git python && \
-    chown -R 1000:1000 python
+# 安装Python 3.11和其他系统依赖
+RUN apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-dev \
+    python3.11-venv \
+    python3.11-distutils \
+    nodejs \
+    npm \
+    gcc \
+    build-essential \
+    libffi-dev \
+    libssl-dev \
+    bash \
+    supervisor \
+    tar \
+    gzip \
+    libicu-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
-# --- Python Virtual Environment Setup ---
-# 1. Create a virtual environment
-RUN python -m venv /app/venv
+# 设置Python 3.11为默认Python版本
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
 
-# 2. Install Python dependencies into the virtual environment
-#    We use the pip from the venv to ensure packages are installed in the correct location.
-RUN /app/venv/bin/pip install --upgrade pip && \
-    /app/venv/bin/pip install -r python/requirements.txt --no-cache-dir && \
-    /app/venv/bin/pip install socksio wechatpy cryptography --no-cache-dir
+# 安装pip for Python 3.11（使用ensurepip模块）
+RUN python3.11 -m ensurepip --upgrade || \
+    (curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 - --force-reinstall)
 
-# Expose ports
+# 升级pip
+RUN python3.11 -m pip install --upgrade pip
+
+# 从GitHub克隆AstrBot项目代码直接到/app目录
+RUN git clone https://github.com/AstrBotDevs/AstrBot.git . \
+    || (git init && \
+        git remote add origin https://github.com/AstrBotDevs/AstrBot.git && \
+        git fetch origin && \
+        git checkout -b main origin/main)
+
+# 安装Python包管理工具uv
+RUN python -m pip install --upgrade pip \
+    && python -m pip install uv
+
+# 安装AstrBot的Python依赖
+RUN uv pip install -r requirements.txt --no-cache-dir --system
+
+# 安装AstrBot额外的Python包
+RUN uv pip install socksio uv pyffmpeg pilk --no-cache-dir --system
+
+# 释出ffmpeg并配置
+RUN python -c "from pyffmpeg import FFmpeg; ff = FFmpeg();"
+
+# 添加ffmpeg到PATH环境变量
+ENV PATH="${PATH}:/root/.pyffmpeg/bin"
+RUN echo 'export PATH=$PATH:/root/.pyffmpeg/bin' >> ~/.bashrc
+
+# 下载并解压Lagrange.OneBot
+RUN mkdir -p /tmp/lagrange && \
+    cd /tmp/lagrange && \
+    wget https://github.com/LagrangeDev/Lagrange.Core/releases/download/nightly/Lagrange.OneBot_linux-x64_net9.0_SelfContained.tar.gz && \
+    tar -xzf Lagrange.OneBot_linux-x64_net9.0_SelfContained.tar.gz && \
+    # 将实际的可执行文件及其依赖复制到/app目录
+    cp -r /tmp/lagrange/Lagrange.OneBot/bin/Release/net9.0/linux-x64/publish/* /app/ && \
+    # 设置执行权限
+    chmod +x /app/Lagrange.OneBot && \
+    # 清理临时文件
+    rm -rf /tmp/lagrange
+
+# 创建Lagrange配置目录
+RUN mkdir -p /app/lagrange_config
+
+# 创建supervisor日志目录
+RUN mkdir -p /var/log/supervisor
+
+# 复制supervisor配置文件（如果存在本地配置文件）
+# 注意：这个文件需要在构建Docker镜像的目录中存在
+COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+
+# 暴露端口
+# AstrBot端口
 EXPOSE 6185
 EXPOSE 6186
 
-# --- Supervisor Configuration ---
-# Configure supervisor to run both .NET and Python applications
-# The Python command now points to the python executable inside the virtual environment.
-RUN echo "[supervisord]" > /etc/supervisord.conf && \
-    echo "nodaemon=true" >> /etc/supervisord.conf && \
-    echo "logfile=/dev/stdout" >> /etc/supervisord.conf && \
-    echo "logfile_maxbytes=0" >> /etc/supervisord.conf && \
-    echo "loglevel=info" >> /etc/supervisord.conf && \
-    echo "" >> /etc/supervisord.conf && \
-    echo "[program:dotnet]" >> /etc/supervisord.conf && \
-    echo "command=/app/bin/docker-entrypoint.sh" >> /etc/supervisord.conf && \
-    echo "autostart=true" >> /etc/supervisord.conf && \
-    echo "autorestart=true" >> /etc/supervisord.conf && \
-    echo "stdout_logfile=/dev/stdout" >> /etc/supervisord.conf && \
-    echo "stdout_logfile_maxbytes=0" >> /etc/supervisord.conf && \
-    echo "stderr_logfile=/dev/stderr" >> /etc/supervisord.conf && \
-    echo "stderr_logfile_maxbytes=0" >> /etc/supervisord.conf && \
-    echo "" >> /etc/supervisord.conf && \
-    echo "[program:python]" >> /etc/supervisord.conf && \
-    echo "command=/app/venv/bin/python /app/python/main.py" >> /etc/supervisord.conf && \
-    echo "directory=/app/python" >> /etc/supervisord.conf && \
-    echo "autostart=true" >> /etc/supervisord.conf && \
-    echo "autorestart=true" >> /etc/supervisord.conf && \
-    echo "stdout_logfile=/dev/stdout" >> /etc/supervisord.conf && \
-    echo "stdout_logfile_maxbytes=0" >> /etc/supervisord.conf && \
-    echo "stderr_logfile=/dev/stderr" >> /etc/supervisord.conf && \
-    echo "stderr_logfile_maxbytes=0" >> /etc/supervisord.conf
+# 设置默认shell
+SHELL ["/bin/bash", "-c"]
 
-# Set the command to run supervisor
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf"]
+# 使用supervisor启动和管理所有进程
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
